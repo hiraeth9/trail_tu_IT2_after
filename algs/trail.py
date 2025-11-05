@@ -5,7 +5,7 @@ import random, numpy as np
 from core.wsn_core import AlgorithmBase, Simulation, Node, Cluster, dist, clamp, \
     BASE_P_CH, CH_COOLDOWN, COMM_RANGE, CH_NEIGHBOR_RANGE, \
     e_tx, e_rx, DATA_PACKET_BITS
-from core.it2_selftrust import self_trust_from_counts
+from core.it2_selftrust import self_trust_from_counts,self_trust_from_incoming
 class TRAIL(AlgorithmBase):
     @property
     def name(self): return "TRAIL (ours)"
@@ -58,7 +58,7 @@ class TRAIL(AlgorithmBase):
         # 冗余强度边界适度放宽（供自适应上调）
         self.rt_min, self.rt_max = 0.10, 0.45
 
-        self.w_it2 = 0.60  # ← 新增：IT2 权重（0~1，越大越信 IT2）
+        self.w_it2 = 0.80  # ← 新增：IT2 权重（0~1，越大越信 IT2）
 
     def select_cluster_heads(self):
         import math
@@ -323,22 +323,28 @@ class TRAIL(AlgorithmBase):
         )
 
     def apply_watchdog(self, ch: Node, ok: bool, timely: bool, ch_nodes: List[Node]):
-        # === 新增：IT2 计数 ===
-        if ok:
-            if timely:
-                ch.it2_succ_t += 1.0
-            else:
-                ch.it2_succ_d += 1.0
-        else:
-            ch.it2_fail += 1.0
-
-        # 选最近的3个观察者（用于“目击”但不重复计数）
+        # 选最近的3个观察者（用于“目击”）
         neigh = []
         for other in ch_nodes:
-            if other.nid == ch.nid or (not other.alive): continue
+            if other.nid == ch.nid or (not other.alive):
+                continue
             neigh.append((dist(ch.pos(), other.pos()), other))
         neigh.sort(key=lambda x: x[0])
         watchers = [p[1] for p in neigh[:3]]
+
+        # —— IT2 入向计数：由“观察者 k 对 ch”的观点来记账 —— #
+        for w in watchers:
+            buf = ch.in_it2.get(w.nid)
+            if buf is None:
+                buf = [0.0, 0.0, 0.0]  # [succ_timely, succ_delay, fail]
+                ch.in_it2[w.nid] = buf
+            if ok:
+                if timely:
+                    buf[0] += 1.0
+                else:
+                    buf[1] += 1.0
+            else:
+                buf[2] += 1.0
 
         mode = self.mode_by_ch.get(ch.nid, 'direct')
         # 只记录一次“全局成败”（避免被多个观察者重复算）
@@ -349,9 +355,9 @@ class TRAIL(AlgorithmBase):
             self._rel_t += 1
             if ok: self._rel_s += 1
 
+        # —— 以下保持原有的可疑度/直达-中继记忆更新 —— #
         for _ in watchers:
             if ok and timely:
-                # 成功：更快“去可疑化”，增强对应路径的 EWMA
                 ch.suspicion = max(0.0, ch.suspicion - 0.06)
                 ch.observed_success += 0.45
                 if mode == 'direct':
@@ -361,7 +367,6 @@ class TRAIL(AlgorithmBase):
                     ch.rly_val = 0.88 * ch.rly_val + 0.12 * 1.0
                     ch.rly_cnt += 1
             else:
-                # 失败：relay 失败更重惩罚；直传稍轻，避免全局过度悲观
                 if mode == 'relay':
                     if random.random() < 0.72:
                         ch.observed_fail += 0.70
@@ -379,19 +384,27 @@ class TRAIL(AlgorithmBase):
     def finalize_trust_blacklist(self):
         sim = self.sim
         for n in sim.alive_nodes():
+            # —— Beta 信任（保持原节奏）——
             n.trust_s = n.trust_s * self.forget + n.observed_success
             n.trust_f = n.trust_f * self.forget + n.observed_fail + 0.20 * n.suspicion
-            # 指数遗忘（与 Beta 同节奏）
-            n.it2_succ_t *= self.forget
-            n.it2_succ_d *= self.forget
-            n.it2_fail *= self.forget
 
-            # 计数 → DLR/DPR → IT2 脆化
-            st =self_trust_from_counts(n.it2_succ_t, n.it2_succ_d, n.it2_fail)
+            # —— 入向 IT2 观测：指数遗忘 + 清理 —— #
+            to_del = []
+            for obs_id, buf in n.in_it2.items():
+                buf[0] *= self.forget  # succ_timely
+                buf[1] *= self.forget  # succ_delay
+                buf[2] *= self.forget  # fail
+                if (buf[0] + buf[1] + buf[2]) <= 1e-9:
+                    to_del.append(obs_id)
+            for k in to_del:
+                n.in_it2.pop(k, None)
+
+            # —— 别人对我 → 聚合成自信任 —— #
+            st = self_trust_from_incoming(n.in_it2)
             # 轻度 EMA 抑制抖动
-            n.it2_self = 0.7 * n.it2_self + 0.3 * st
+            n.it2_self = 0.8 * n.it2_self + 0.2 * st
 
-            # 需要“低信任+至少一次击穿”，或“连续击穿超阈”，或“高可疑(≥0.85)+出现过击穿”
+            # —— 黑名单条件（保持不变）——
             if (self._mix_trust(n) < self.trust_blacklist and n.consecutive_strikes >= 1) or \
                     (n.consecutive_strikes >= self.strike_threshold) or \
                     (n.suspicion >= 0.85 and n.consecutive_strikes >= 1):

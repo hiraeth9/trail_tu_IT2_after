@@ -77,8 +77,10 @@ class Node:
     it2_succ_t: float = 0.0  # 及时成功数
     it2_succ_d: float = 0.0  # 延迟成功数
     it2_fail: float = 0.0  # 失败数
-    it2_self: float = 0.5  # IT2 输出的自信任（[0,1]）
+    it2_self: float = 0.8  # IT2 输出的自信任（[0,1]）
 
+    # 别人对我：观察者 k→我的 IT2 观测计数 [succ_timely, succ_delay, fail]
+    in_it2: Dict[int, list] = field(default_factory=dict)
     def pos(self): return (self.x, self.y)
 
     def trust(self): return (self.trust_s + 1.0) / (self.trust_s + self.trust_f + 2.0)
