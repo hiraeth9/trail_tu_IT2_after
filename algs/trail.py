@@ -5,7 +5,7 @@ import random, numpy as np
 from core.wsn_core import AlgorithmBase, Simulation, Node, Cluster, dist, clamp, \
     BASE_P_CH, CH_COOLDOWN, COMM_RANGE, CH_NEIGHBOR_RANGE, \
     e_tx, e_rx, DATA_PACKET_BITS
-
+from core.it2_selftrust import self_trust_from_counts
 class TRAIL(AlgorithmBase):
     @property
     def name(self): return "TRAIL (ours)"
@@ -14,9 +14,21 @@ class TRAIL(AlgorithmBase):
     @property
     def trust_blacklist(self): return 0.42
 
+
+    def _mix_trust(self, n: Node) -> float:
+        """TRAIL 内部用：Beta 与 IT2 的凸组合"""
+        t_beta = float(n.trust())
+        t_it2 = float(getattr(n, "it2_self", t_beta))
+        # 夹紧到[0,1]
+        return clamp((1.0 - self.w_it2) * t_beta + self.w_it2 * t_it2, 0.0, 1.0)
+
+    def node_trust(self, n: Node) -> float:
+        """覆盖 AlgorithmBase.node_trust：核心 assign_members / 冗余 也走混合信任"""
+        return self._mix_trust(n)
+
     @property
     def forget(self):
-        return 0.94
+        return 0.98
 
     @property
     def strike_threshold(self):
@@ -46,47 +58,151 @@ class TRAIL(AlgorithmBase):
         # 冗余强度边界适度放宽（供自适应上调）
         self.rt_min, self.rt_max = 0.10, 0.45
 
+        self.w_it2 = 0.60  # ← 新增：IT2 权重（0~1，越大越信 IT2）
+
     def select_cluster_heads(self):
+        import math
+        import numpy as _np
+        try:
+            import cvxpy as cp
+        except Exception:
+            cp = None  # 缺库则回退到原常数权重
+
         sim = self.sim
         alive = [n for n in sim.alive_nodes() if not n.blacklisted]
-        if not alive: return
-        energies = [n.energy for n in alive];
+        if not alive:
+            return
+
+        # —— 预处理：归一化用的区间 ——
+        energies = [n.energy for n in alive]
         e_min, e_max = min(energies), max(energies)
-        dists = [dist(n.pos(), sim.bs) for n in alive];
+        dists = [dist(n.pos(), sim.bs) for n in alive]
         d_min, d_max = min(dists), max(dists)
-        q_levels = [n.last_queue_level for n in alive];
+        q_levels = [n.last_queue_level for n in alive]
         q_min, q_max = min(q_levels), max(q_levels)
 
-        for n in alive:
-            if (sim.round - n.last_ch_round) < CH_COOLDOWN:
-                continue
-            e = (n.energy - e_min) / (e_max - e_min + 1e-9)
-            t = n.trust()
-            q = 1.0 - (n.last_queue_level - q_min) / (q_max - q_min + 1e-9)
-            b = 1.0 - (dist(n.pos(), sim.bs) - d_min) / (d_max - d_min + 1e-9)
-            s_pen = 1.0 - max(0.0, min(1.0, 1.0 - n.suspicion))
+        # —— 候选集合：尊重冷却时间 ——
+        candidates = [n for n in alive if (sim.round - n.last_ch_round) >= CH_COOLDOWN]
+        if not candidates:
+            return
 
-            # 能量/信任权重更高，怀疑惩罚降权；提高抽样基线避免稀疏
-            score = 0.40 * e + 0.30 * (t - 0.03 * s_pen) + 0.18 * q + 0.08 * b
+        # —— 组装候选的特征向量（与原始打分一致） ——
+        def _norm_e(x):
+            return (x - e_min) / (e_max - e_min + 1e-9)
+
+        def _norm_q(x):
+            return 1.0 - (x - q_min) / (q_max - q_min + 1e-9)
+
+        def _norm_b(d):
+            return 1.0 - (d - d_min) / (d_max - d_min + 1e-9)
+
+        e = _np.array([_norm_e(n.energy) for n in candidates], dtype=float)
+        t = _np.array([self._mix_trust(n) for n in candidates], dtype=float)
+        q = _np.array([_norm_q(n.last_queue_level) for n in candidates], dtype=float)
+        b = _np.array([_norm_b(dist(n.pos(), sim.bs)) for n in candidates], dtype=float)
+        s_pen = _np.array([1.0 - max(0.0, min(1.0, 1.0 - n.suspicion)) for n in candidates], dtype=float)
+
+        # —— 线性能耗项 a_i（用 LEACH 两段模型 e_tx(bits, d)） ——
+        bits = DATA_PACKET_BITS
+        a = _np.array([e_tx(bits, dist(n.pos(), sim.bs)) for n in candidates], dtype=float)
+
+        # —— 二次均衡项的分母 r_i（用归一化能量，防止过度使用某些节点） ——
+        r = _np.clip(e, 1e-3, None)
+
+        # —— 目标 CH 个数（与原逻辑一致：先按 8% 基线，再允许到 12% 的自适应上限） ——
+        avg_q = float(_np.mean([n.last_queue_level for n in alive])) if alive else 0.0
+        target_ratio = 0.08 + clamp((avg_q - 1.0) * 0.01, 0.0, 0.04)  # 8% ~ 12%
+        K = max(1, int(round(target_ratio * len(alive))))  # 作为 QP 的 Σx 约束
+
+        # —— 用分位数设定“平均质量门槛” ——
+        def qtile(x, q):
+            x = _np.asarray(x, dtype=float)
+            if x.size == 0:
+                return 0.0
+            return float(_np.nanpercentile(_np.clip(x, -1e9, 1e9), q))
+
+        tau_t = qtile(t, 60)  # 平均信任下限
+        bar_e = qtile(e, 60)  # 平均能量下限
+        bar_q = qtile(q, 60)  # 平均“低拥塞”下限
+        bar_b = qtile(b, 60)  # 平均“近汇聚”下限
+        bar_g = qtile(1.0 - s_pen, 60)  # “好行为”(低可疑) 下限，用于产生 eta
+
+        # —— 解 QP 以获得对偶值 → 自适应权重 ——
+        if cp is None or len(candidates) == 0:
+            w_e, w_t, w_q, w_b, eta = 0.40, 0.30, 0.18, 0.08, 0.03
+        else:
+            n = len(candidates)
+            x = cp.Variable(n)
+            gamma = float(_np.median(a)) if _np.isfinite(_np.median(a)) and _np.median(a) > 0 else 1.0
+
+            obj = cp.sum(a @ x) + cp.sum(cp.multiply(gamma / (2.0 * r), cp.square(x)))
+            cons = [
+                cp.sum(x) == K,
+                K * tau_t - t @ x <= 0,  # Σ t >= K*tau_t
+                K * bar_e - e @ x <= 0,  # Σ e >= K*bar_e
+                K * bar_q - q @ x <= 0,  # Σ q >= K*bar_q
+                K * bar_b - b @ x <= 0,  # Σ b >= K*bar_b
+                K * bar_g - (1.0 - s_pen) @ x <= 0,  # Σ(1-s) >= K*bar_g
+                x >= 0, x <= 1
+            ]
+            prob = cp.Problem(cp.Minimize(obj), cons)
+
+            solved = False
+            for solver in (getattr(cp, "OSQP", None), getattr(cp, "SCS", None), None):
+                try:
+                    if solver is None:
+                        prob.solve(warm_start=True)
+                    else:
+                        prob.solve(solver=solver, warm_start=True)
+                    if prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        solved = True
+                        break
+                except Exception:
+                    continue
+
+            if not solved:
+                w_e, w_t, w_q, w_b, eta = 0.40, 0.30, 0.18, 0.08, 0.03
+            else:
+                lam_t = max(0.0, float(cons[1].dual_value))
+                lam_e = max(0.0, float(cons[2].dual_value))
+                lam_q = max(0.0, float(cons[3].dual_value))
+                lam_b = max(0.0, float(cons[4].dual_value))
+                lam_g = max(0.0, float(cons[5].dual_value))
+
+                S = lam_t + lam_e + lam_q + lam_b
+                if S <= 1e-12:
+                    w_e = w_t = w_q = w_b = 0.25
+                else:
+                    w_e, w_t, w_q, w_b = lam_e / S, lam_t / S, lam_q / S, lam_b / S
+
+                eta = lam_g / (lam_t + 1e-12)
+                eta = float(_np.clip(eta, 0.0, 1.0))
+
+        # —— 第一段：用“非常数权重”打分 + 概率抽样（保留原基线/框架） ——
+        for idx, n in enumerate(candidates):
+            e_i = e[idx];
+            t_i = t[idx];
+            q_i = q[idx];
+            b_i = b[idx];
+            s_i = s_pen[idx]
+            score = w_e * e_i + w_t * (t_i - eta * s_i) + w_q * q_i + w_b * b_i
             p = clamp(BASE_P_CH * (0.70 + score), 0.0, 1.0)
             if random.random() < p:
-                n.is_ch = True;
+                n.is_ch = True
                 n.last_ch_round = sim.round
                 sim.clusters[n.nid] = Cluster(n.nid)
 
-        # —— 自适应：CH 至少覆盖 8% 节点，平均队列越高上限越高（最多到 12%）
-        avg_q = float(np.mean([n.last_queue_level for n in alive])) if alive else 0.0
-        target_ratio = 0.08 + clamp((avg_q - 1.0) * 0.01, 0.0, 0.04)  # 8% ~ 12%
-        need_total = max(1, int(target_ratio * len(alive)))
+        # —— 第二段：若数量不足，继续用同一组(w, eta)补齐（替代原来的常数 0.44/0.26/...） ——
+        need_total = K
         if len(sim.clusters) < need_total:
             scored = []
             for nn in [x for x in alive if not x.is_ch]:
-                ee = (nn.energy - e_min) / (e_max - e_min + 1e-9)
-                tt = nn.trust()
-                qq = 1.0 - (nn.last_queue_level - q_min) / (q_max - q_min + 1e-9)
-                bb = 1.0 - (dist(nn.pos(), sim.bs) - d_min) / (d_max - d_min + 1e-9)
+                ee = _norm_e(nn.energy)
+                tt = self._mix_trust(nn)
+                qq = _norm_q(nn.last_queue_level)
+                bb = _norm_b(dist(nn.pos(), sim.bs))
                 ss = 1.0 - max(0.0, min(1.0, 1.0 - nn.suspicion))
-                sc = 0.44 * ee + 0.26 * (tt - 0.10 * ss) + 0.15 * qq + 0.15 * bb
+                sc = w_e * ee + w_t * (tt - eta * ss) + w_q * qq + w_b * bb
                 scored.append((sc, nn))
             scored.sort(key=lambda x: x[0], reverse=True)
             need = need_total - len(sim.clusters)
@@ -97,7 +213,7 @@ class TRAIL(AlgorithmBase):
 
     def allow_member_redundancy(self, member: Node, ch: Node) -> bool:
         alive = self.sim.alive_nodes()
-        if not (self.trust_blacklist <= ch.trust() < self.trust_warn):
+        if not (self.trust_blacklist <= self._mix_trust(ch) < self.trust_warn):
             return False
         if not alive:
             return False
@@ -110,7 +226,7 @@ class TRAIL(AlgorithmBase):
         risk = float(
             _np.mean([1.0 if (getattr(n, "blacklisted", False) or n.suspicion >= 0.60) else 0.0 for n in alive]))
         boost = 1.0 + 0.5 * risk  # 风险 50% 时，冗余概率提升 25%
-        prob = min(0.95, self.rt_ratio * (1.0 - ch.trust()) * boost)
+        prob = min(0.95, self.rt_ratio * (1.0 - self._mix_trust(ch)) * boost)
         return (random.random() < prob)
 
     def choose_ch_relay(self, ch: Node, ch_nodes: list):
@@ -150,7 +266,7 @@ class TRAIL(AlgorithmBase):
                 continue
 
             # 信任硬门槛 + 能量硬门槛
-            if other.trust() < t_floor:
+            if self._mix_trust(other) < t_floor:
                 continue
             if e_med > 0.0 and other.energy < 0.90 * e_med:
                 continue
@@ -164,11 +280,11 @@ class TRAIL(AlgorithmBase):
             rel = other.dir_val
 
             # —— 惩罚/奖励，带下限钳制（防止极端值套利） ——
-            penalty = 1.0 + self.queue_pen * other.queue_level + self.trust_pen * (1.0 - other.trust())
+            penalty = 1.0 + self.queue_pen * other.queue_level + self.trust_pen * (1.0 - self._mix_trust(other))
             penalty = max(1.05, penalty)  # 惩罚下限 1.05
             reward = 1.0 - self.rel_w * rel
             reward = max(0.62, reward)  # 奖励下限（最多降到 0.62 倍）
-            trust_bonus = 1.0 - 0.20 * (1.0 - other.trust())
+            trust_bonus = 1.0 - 0.20 * (1.0 - self._mix_trust(other))
 
             score = two_hop_cost * penalty * reward * trust_bonus
             cand_pool.append((score, other, d1, d2, two_hop_cost))
@@ -192,11 +308,11 @@ class TRAIL(AlgorithmBase):
 
         if explore:
             # 探索也要有底线：只在“信任 ≥ t_floor”的候选里随机
-            use_relay = (relay.trust() >= t_floor) and (random.random() < 0.5)
+            use_relay = (self._mix_trust(relay) >= t_floor) and (random.random() < 0.5)
         else:
             use_relay = (best_cost + 1e-12) < (self.alpha * cost_direct) and \
                         (relay.queue_level <= ch.queue_level + qlimit) and (relay.energy > 0.08) and \
-                        (relay.trust() >= t_floor)
+                        (self._mix_trust(relay) >= t_floor)
 
         # 衰减探索率 + 记录模式
         self.epsilon = max(self.min_epsilon, self.epsilon * self.eps_decay)
@@ -207,6 +323,15 @@ class TRAIL(AlgorithmBase):
         )
 
     def apply_watchdog(self, ch: Node, ok: bool, timely: bool, ch_nodes: List[Node]):
+        # === 新增：IT2 计数 ===
+        if ok:
+            if timely:
+                ch.it2_succ_t += 1.0
+            else:
+                ch.it2_succ_d += 1.0
+        else:
+            ch.it2_fail += 1.0
+
         # 选最近的3个观察者（用于“目击”但不重复计数）
         neigh = []
         for other in ch_nodes:
@@ -256,8 +381,18 @@ class TRAIL(AlgorithmBase):
         for n in sim.alive_nodes():
             n.trust_s = n.trust_s * self.forget + n.observed_success
             n.trust_f = n.trust_f * self.forget + n.observed_fail + 0.20 * n.suspicion
+            # 指数遗忘（与 Beta 同节奏）
+            n.it2_succ_t *= self.forget
+            n.it2_succ_d *= self.forget
+            n.it2_fail *= self.forget
+
+            # 计数 → DLR/DPR → IT2 脆化
+            st =self_trust_from_counts(n.it2_succ_t, n.it2_succ_d, n.it2_fail)
+            # 轻度 EMA 抑制抖动
+            n.it2_self = 0.7 * n.it2_self + 0.3 * st
+
             # 需要“低信任+至少一次击穿”，或“连续击穿超阈”，或“高可疑(≥0.85)+出现过击穿”
-            if (n.trust() < self.trust_blacklist and n.consecutive_strikes >= 1) or \
+            if (self._mix_trust(n) < self.trust_blacklist and n.consecutive_strikes >= 1) or \
                     (n.consecutive_strikes >= self.strike_threshold) or \
                     (n.suspicion >= 0.85 and n.consecutive_strikes >= 1):
                 n.blacklisted = True
