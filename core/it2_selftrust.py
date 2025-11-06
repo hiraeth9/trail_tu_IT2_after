@@ -33,4 +33,4 @@ def self_trust_from_incoming(in_map: dict) -> float:
         ti = self_trust_from_counts(st, sd, fl)
         acc += ti * w
         total_w += w
-    return (acc / total_w) if total_w > 0.0 else 0.5
+    return (acc / total_w) if total_w > 0.0 else 0.975

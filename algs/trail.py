@@ -38,7 +38,7 @@ class TRAIL(AlgorithmBase):
         super().__init__(sim)
         # —— 探索/冗余/能耗-可靠性策略参数 ——
         # —— 探索/冗余/能耗-可靠性策略参数（更稳健） ——
-        self.rt_ratio = 0.30
+        self.rt_ratio = 0.34
         self.epsilon = 0.16  # 更快收敛，少随机抖动
         self.eps_decay = 0.992
         self.min_epsilon = 0.02
@@ -58,7 +58,7 @@ class TRAIL(AlgorithmBase):
         # 冗余强度边界适度放宽（供自适应上调）
         self.rt_min, self.rt_max = 0.10, 0.45
 
-        self.w_it2 = 0.80  # ← 新增：IT2 权重（0~1，越大越信 IT2）
+        self.w_it2 = 0.05  # ← 新增：IT2 权重（0~1，越大越信 IT2）
 
     def select_cluster_heads(self):
         import math
@@ -402,7 +402,7 @@ class TRAIL(AlgorithmBase):
             # —— 别人对我 → 聚合成自信任 —— #
             st = self_trust_from_incoming(n.in_it2)
             # 轻度 EMA 抑制抖动
-            n.it2_self = 0.8 * n.it2_self + 0.2 * st
+            n.it2_self = 0.95 * n.it2_self + 0.05 * st
 
             # —— 黑名单条件（保持不变）——
             if (self._mix_trust(n) < self.trust_blacklist and n.consecutive_strikes >= 1) or \
